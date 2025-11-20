@@ -21,13 +21,13 @@ training_callbacks:
   early_stopping:
     patience: 20
 
-exp_name: transformer_hyperparams_search
+exp_name: transformer_hyperparams_search_2
 seed: 42
 check_stimuli_responses_match: false
 
 dataloader:
-  batch_size: 128
-  train_chunk_size: 50
+  batch_size: 64
+  # train_chunk_size: 50
 
 objective_target: val_correlation
 
@@ -41,23 +41,27 @@ hydra:
       seed: 42
     direction: maximize
     study_name: ${exp_name}
-    storage: sqlite:///transformer_hyperparams_search.db
+    storage: sqlite:///transformer_hyperparams_search_2.db
     n_trials: 150
     n_jobs: 1
     params:
-      model.core.Demb: choice(16, 32, 64, 128)
-      model.core.patch_size: choice(6, 12, 24)
-      model.core.temporal_patch_size: choice(8, 16, 32)
-      model.core.spatial_stride: choice(6, 12, 24)
-      model.core.num_spatial_blocks: choice(3, 6, 12)
-      model.core.num_temporal_blocks: choice(3, 6, 12)
-      model.core.pad_frame: choice(true, false)
+      dataloader.train_chunk_size: choice(50, 60, 70)
+      model.core.temporal_patch_size: choice(20, 25, 30, 35, 40)
+      model.core.num_spatial_blocks: range(12, 24)
+      model.core.num_temporal_blocks: range(1, 6)
+      model.core.reg_scale: interval(0.0, 0.3)
 
-      model.learning_rate: interval(1e-4, 1e-2)
-      model.weight_decay: choice(0.05, 0.1, 0.15)
-
-      trainer.accumulate_grad_batches: choice(1, 5, 10)
-      dataloader.batch_size: choice(64, 128, 256)
+model:
+  learning_rate: 5e-3
+  weight_decay: 0.05
+  core:
+    pad_frame: false
+    Demb: 64
+    patch_size: 12
+    spatial_stride: 6
+    use_torch_compile: false
+  readout:
+    reg_avg: false
 
 paths:
   load_model_path: null # e.g. hoefling_2024_base_high_res or path to a .ckpt model
@@ -71,4 +75,4 @@ paths:
 trainer:
   max_epochs: 100
   precision: 16-mixed
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 5

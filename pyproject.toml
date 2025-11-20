@@ -61,6 +61,7 @@ dev = [
 devmodels = ["neuralpredictors"]
 optuna = [ # for hyperparameter tuning
     "hydra-optuna-sweeper",
+    "sqlalchemy==1.4.45",
 ]
 
 [tool.setuptools]

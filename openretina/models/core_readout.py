@@ -1,5 +1,6 @@
 import inspect
 import logging
+import math
 import os
 import warnings
 from typing import Any, Iterable, Optional
@@ -11,20 +12,18 @@ from jaxtyping import Float, Int
 from lightning import LightningModule
 from lightning.pytorch.utilities import grad_norm
 from omegaconf import DictConfig
-import math
-
-from openretina.utils.transformer_utils import SparseAttentionViz
-
 
 from openretina.data_io.base_dataloader import DataPoint
 from openretina.modules.core.base_core import Core, SimpleCoreWrapper
+from openretina.modules.core.transformer_core import ViViTCore
 from openretina.modules.losses import CorrelationLoss3d, PoissonLoss3d
 from openretina.modules.readout.multi_readout import (
-    MultiGaussianReadoutWrapper,MultiSampledGaussianReadoutWrapper 
+    MultiGaussianMaskReadout,
+    MultiReadoutBase,
+    MultiSampledGaussianReadout,
 )
-from openretina.modules.core.transformer_core import ViViTCoreWrapper
-
 from openretina.utils.file_utils import get_cache_directory, get_local_file_path
+from openretina.utils.transformer_utils import SparseAttentionViz
 
 LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +54,7 @@ class BaseCoreReadout(LightningModule):
         core: Core,
         readout: MultiReadoutBase,
         learning_rate: float,
+        weight_decay: float = 0.0,
         loss: nn.Module | None = None,
         validation_loss: nn.Module | None = None,
         data_info: dict[str, Any] | None = None,
@@ -78,6 +78,7 @@ class BaseCoreReadout(LightningModule):
         self.core = core
         self.readout = readout
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
         self.loss = loss if loss is not None else PoissonLoss3d()
         self.validation_loss = validation_loss if validation_loss is not None else CorrelationLoss3d(avg=True)
         if data_info is None:
@@ -178,7 +179,11 @@ class BaseCoreReadout(LightningModule):
                 self.trainer.save_checkpoint(final_path)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
         lr_decay_factor = 0.3
         patience = 5
         tolerance = 0.0005
@@ -283,6 +288,7 @@ class UnifiedCoreReadout(BaseCoreReadout):
         core: DictConfig,
         readout: DictConfig,
         learning_rate: float = 0.001,
+        weight_decay: float = 0.0,
         data_info: dict[str, Any] | None = None,
     ):
         """
@@ -310,7 +316,9 @@ class UnifiedCoreReadout(BaseCoreReadout):
         hidden_channels = tuple(hidden_channels)
         in_shape = tuple(in_shape)
 
-        core.channels = (in_shape[0], *hidden_channels)
+        if "channels" in core:
+            core.channels = (in_shape[0], *hidden_channels)
+
         core_module = hydra.utils.instantiate(
             core,
             n_neurons_dict=n_neurons_dict,
@@ -330,7 +338,13 @@ class UnifiedCoreReadout(BaseCoreReadout):
             mean_activity_dict=mean_activity_dict,
         )
 
-        super().__init__(core=core_module, readout=readout_module, learning_rate=learning_rate, data_info=data_info)
+        super().__init__(
+            core=core_module,
+            readout=readout_module,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            data_info=data_info,
+        )
 
 
 class ExampleCoreReadout(BaseCoreReadout):
@@ -368,6 +382,7 @@ class ExampleCoreReadout(BaseCoreReadout):
         readout_gamma_masks: float = 0.0,
         readout_reg_avg: bool = False,
         learning_rate: float = 0.01,
+        weight_decay: float = 0.0,
         cut_first_n_frames_in_core: int = 30,
         dropout_rate: float = 0.0,
         maxpool_every_n_layers: Optional[int] = None,
@@ -419,7 +434,13 @@ class ExampleCoreReadout(BaseCoreReadout):
             readout_reg_avg,
         )
 
-        super().__init__(core=core, readout=readout, learning_rate=learning_rate, data_info=data_info)
+        super().__init__(
+            core=core,
+            readout=readout,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            data_info=data_info,
+        )
 
 
 def load_core_readout_from_remote(
@@ -461,18 +482,19 @@ def load_core_readout_model(
         # Support for legacy CoreReadout model
         return ExampleCoreReadout.load_from_checkpoint(local_path, map_location=device)
 
+
 class ViViTCoreReadout(BaseCoreReadout):
     """Core + Readout model using ViViTCoreWrapper and MultiSampledGaussianReadoutWrapper."""
 
     def __init__(
         self,
         input_shape: tuple[int, int, int, int, int],  # (batch, channels, time, height, width)
-        channels: tuple[int,int],
+        channels: tuple[int, int],
         n_neurons_dict: dict[str, int],
         Demb: int = 128,
         patch_size: int = 8,
         temporal_patch_size: int = 6,
-        reg_tokens: int=3,
+        reg_tokens: int = 3,
         num_spatial_blocks: int = 3,
         num_temporal_blocks: int = 3,
         pos_encoding: int = 5,
@@ -489,15 +511,25 @@ class ViViTCoreReadout(BaseCoreReadout):
         readout_gamma: float = 0.4,
         readout_reg_avg: bool = False,
         learning_rate: float = 0.001,
+        weight_decay: float = 0.0,
         norm: str = "layernorm",
-        drop_path : float=0.1,
-        use_rope: bool= True,
+        drop_path: float = 0.1,
+        use_rope: bool = True,
         ff_activation: str = "gelu",
-        use_causal_attention: bool =True,
+        use_causal_attention: bool = True,
         patch_mode: bool = True,
+        use_sdpa_attention: bool = False,
+        use_torch_compile: bool = False,
+        reg_scale: float = 0.0,
         data_info: dict[str, Any] | None = None,
     ):
         _, C, T, H, W = input_shape
+        warnings.warn(
+            "ViViTCoreReadout is kept for backward compatibility. Prefer using UnifiedCoreReadout "
+            "with the ViViT core config instead.",
+            UserWarning,
+            stacklevel=2,
+        )
 
         # Calculate padding
         t_pad = math.ceil(T / temporal_stride) * temporal_stride + temporal_patch_size - temporal_stride - T
@@ -509,9 +541,9 @@ class ViViTCoreReadout(BaseCoreReadout):
         H_out = math.ceil((H + h_pad) / patch_size)
         W_out = math.ceil((W + w_pad) / patch_size)
         in_shape_readout = (Demb, T_out, H_out, W_out)
-        
+
         # Define readout
-        readout = MultiSampledGaussianReadoutWrapper(
+        readout = MultiSampledGaussianReadout(
             in_shape=in_shape_readout,
             n_neurons_dict=n_neurons_dict,
             bias=readout_bias,
@@ -520,9 +552,9 @@ class ViViTCoreReadout(BaseCoreReadout):
             gamma=readout_gamma,
             reg_avg=readout_reg_avg,
         )
-        
+
         # Define core directly with all arguments
-        core = ViViTCoreWrapper(
+        core = ViViTCore(
             in_shape=input_shape,
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,
@@ -535,24 +567,19 @@ class ViViTCoreReadout(BaseCoreReadout):
             patch_mode=patch_mode,
             pos_encoding=pos_encoding,
             num_heads=num_heads,
+            reg_tokens=reg_tokens,
+            mlp_ratio=mlp_ratio,
             num_spatial_blocks=num_spatial_blocks,
             num_temporal_blocks=num_temporal_blocks,
-            reg_tokens=reg_tokens,
-            dropout=dropout,
-            mlp_ratio=mlp_ratio,
-            channels=C,
-            drop_path =drop_path,
-            use_rope = use_rope,
             ff_activation=ff_activation,
-            spatial_depth=num_spatial_blocks,
-            temporal_depth=num_temporal_blocks,
-            use_causal_attention=use_causal_attention,
             head_dim=Demb // num_heads,
-            ff_dim=int(Demb * mlp_ratio),
-            
             mha_dropout=dropout,
+            drop_path=drop_path,
             ff_dropout=dropout,
-           
+            use_causal_attention=use_causal_attention,
+            use_sdpa_attention=use_sdpa_attention,
+            use_torch_compile=use_torch_compile,
+            reg_scale=reg_scale,
         )
 
         # Initialize parent
@@ -560,9 +587,8 @@ class ViViTCoreReadout(BaseCoreReadout):
             core=core,
             readout=readout,
             learning_rate=learning_rate,
+            weight_decay=weight_decay,
             data_info=data_info,
         )
-        self.attn_viz = SparseAttentionViz(outdir="/home/bethge/bkr618/openretina_cache/attn_sparse")
-
-        self.save_hyperparameters()
-
+        attn_cache_dir = os.path.join(get_cache_directory(), "attn_sparse")
+        self.attn_viz = SparseAttentionViz(outdir=attn_cache_dir)
