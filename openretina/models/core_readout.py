@@ -67,16 +67,18 @@ class BaseCoreReadout(LightningModule):
         readout_norms = grad_norm(self.readout, norm_type=2)
         self.log_dict(readout_norms, on_step=False, on_epoch=True)
 
-    def forward(self, x: Float[torch.Tensor, "batch channels t h w"], data_key: str | None = None) -> torch.Tensor:
+    def forward(self, x: Float[torch.Tensor, "batch channels t h w"], data_key: str | None = None, return_core = False) -> torch.Tensor:
         output_core = self.core(x)
         output_readout = self.readout(output_core, data_key=data_key)
+        if return_core:
+            return output_readout, output_core
         return output_readout
 
     def training_step(self, batch: tuple[str, DataPoint], batch_idx: int) -> torch.Tensor:
         session_id, data_point = batch
-        model_output = self.forward(data_point.inputs, session_id)
+        model_output, output_core = self.forward(data_point.inputs, session_id, return_core=True)
         loss = self.loss.forward(model_output, data_point.targets)
-        regularization_loss_core = self.core.regularizer()
+        regularization_loss_core = self.core.regularizer(activations=output_core)
         regularization_loss_readout = self.readout.regularizer(session_id)  # type: ignore
         total_loss = loss + regularization_loss_core + regularization_loss_readout
         correlation = -self.correlation_loss.forward(model_output, data_point.targets)
@@ -379,20 +381,24 @@ class ViViTCoreReadout(BaseCoreReadout):
         use_causal_attention: bool =True,
         patch_mode: bool = True,
         data_info: dict[str, Any] | None = None,
+        reg_lambda: float = 1e-4,
+        activation_lambda: float = 1e-2,
+        smooth_lambda: float = 1e-2
     ):
         _, C, T, H, W = input_shape
 
-        # Calculate padding
-        t_pad = math.ceil(T / temporal_stride) * temporal_stride + temporal_patch_size - temporal_stride - T
-        h_pad = math.ceil(H / spatial_stride) * spatial_stride + patch_size - spatial_stride - H
-        w_pad = math.ceil(W / spatial_stride) * spatial_stride + patch_size - spatial_stride - W
+        if pad_frame:
+            t_pad = (temporal_patch_size - (T - temporal_patch_size) % temporal_stride) % temporal_stride
+            h_pad = (patch_size - (H - patch_size) % spatial_stride) % spatial_stride
+            w_pad = (patch_size - (W - patch_size) % spatial_stride) % spatial_stride
+        else:
+            t_pad = h_pad = w_pad = 0
 
-        # Calculate output dimensions for readout
-        T_out = math.ceil((T + t_pad) / temporal_patch_size)
-        H_out = math.ceil((H + h_pad) / patch_size)
-        W_out = math.ceil((W + w_pad) / patch_size)
+        T_out = (T + t_pad - temporal_patch_size) // temporal_stride + 1
+        H_out = (H + h_pad - patch_size) // spatial_stride + 1
+        W_out = (W + w_pad - patch_size) // spatial_stride + 1
         in_shape_readout = (Demb, T_out, H_out, W_out)
-        
+
         # Define readout
         readout = MultiSampledGaussianReadoutWrapper(
             in_shape=in_shape_readout,
@@ -435,6 +441,9 @@ class ViViTCoreReadout(BaseCoreReadout):
             
             mha_dropout=dropout,
             ff_dropout=dropout,
+            reg_lambda=reg_lambda,
+            activation_lambda=activation_lambda,
+            smooth_lambda=smooth_lambda
            
         )
 

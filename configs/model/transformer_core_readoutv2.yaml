@@ -1,5 +1,5 @@
 # Core and data
-input_shape: [128,2,50,72,64]  # Required at top-level config
+input_shape: [128,1, 100, 50, 50] # Required at top-level config
 n_neurons_dict: ???  # Set dynamically (e.g., in training script after loading sessions)
 _target_: openretina.models.core_readout.ViViTCoreReadout
 _convert_: object

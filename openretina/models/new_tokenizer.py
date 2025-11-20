@@ -216,7 +216,7 @@ class Tokenizer(nn.Module):
 
         # outputs: (B, nt, nh*nw, Demb)
         B, t, p, _ = outputs.shape
-        max_t = max(t, 750)
+        max_t = max(t, 10000)
 
         match self.pos_encoding:
             case 1:

@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 import math
+from openretina.utils.transformer_utils import temporal_moving_average
 from typing import Any
 
 
@@ -48,12 +49,19 @@ class ViViTCoreWrapper(Core):
             use_rope: bool,
             ff_dropout: float,
             use_causal_attention: bool,
+            reg_lambda: float,
+            activation_lambda: float,
+            smooth_lambda: float,
             **kwargs  # Catches _target_, _convert_, and any other Hydra internals
         ):
         super(ViViTCoreWrapper, self).__init__()
         
         self.input_shape = in_shape
         self.reg_tokens = reg_tokens
+        self.reg_lambda = reg_lambda
+        self.activation_lambda = activation_lambda  # activation penalty strength
+        self.smooth_lambda = smooth_lambda    # temporal smoothness penalty
+
         
         print("1. Creating Tokenizer...")
         
@@ -103,6 +111,9 @@ class ViViTCoreWrapper(Core):
             mha_dropout=mha_dropout,
             ff_dropout=ff_dropout,
             use_causal_attention=use_causal_attention,
+            reg_lambda = reg_lambda,
+            activation_lambda = activation_lambda,
+            smooth_lambda = smooth_lambda
         )
         
         # Use the vivit_input_shape which is (T, num_patches, Demb)
@@ -183,6 +194,27 @@ class ViViTCoreWrapper(Core):
                     outputs = block(outputs)
         
         return None
+    
+    def regularizer(self, activations=None):
+        reg_loss = 0.0
+
+        # ----- 1. L2 weight penalty -----
+        for param in self.parameters():
+            reg_loss += torch.sum(param ** 2)
+        reg_loss *= self.reg_lambda
+
+        if activations is not None:
+            # ----- 2. L2 activation penalty -----
+            reg_loss += self.activation_lambda * torch.sum(activations ** 2)
+
+            # ----- 3. Temporal smoothness -----
+            # assumes activations: (batch, channels, time, H, W)
+            if activations.shape[2] > 1:  # check time dimension
+                diff = activations[..., 1:, :, :] - activations[..., :-1, :, :]
+                smooth_loss = torch.mean(diff ** 2)
+                reg_loss += self.smooth_lambda * smooth_loss
+
+        return reg_loss
 
     def forward(
         self,
@@ -200,7 +232,10 @@ class ViViTCoreWrapper(Core):
         # ViViT expects (B, T, P, Demb) which is what tokenizer outputs
         # ViViT processes and returns same shape
         outputs = self.vivit(outputs)
-        
+ 
+        if self.smooth_lambda > 0:
+            outputs = temporal_moving_average(outputs, kernel_size=21) * self.smooth_lambda + outputs * (1 - self.smooth_lambda)
+
         # Rearrange back to spatial format: (B, T, H*W, Demb) -> (B, Demb, T, H, W)
         outputs = self.rearrange(outputs)
         

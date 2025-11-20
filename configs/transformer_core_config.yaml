@@ -1,7 +1,7 @@
 defaults:
-  - data_io: hoefling_2024 # For new data, create data_io config and put its name here
-  - quality_checks: hoefling_2024
-  - dataloader: hoefling_2024 # For new data, create dataloader config and put its name here
+  - data_io: maheswaranathan_2023 # For new data, create data_io config and put its name here
+#  - quality_checks: hoefling_2024
+  - dataloader: maheswaranathan_2023 # For new data, create dataloader config and put its name here
   - model: transformer_core_readoutv2
   - training_callbacks:
     - early_stopping
@@ -14,7 +14,7 @@ defaults:
   - hydra: default
   - _self_ # values in this config will overwrite the defaults
 
-exp_name: transformercore_experiment
+exp_name: transformercore_experiment_maheswaranathan
 seed: 42
 check_stimuli_responses_match: false
 
@@ -25,11 +25,11 @@ dataloader:
 paths:
   cache_dir: ${oc.env:OPENRETINA_CACHE_DIRECTORY} # Remote files are downloaded to this location
   # If data_dir is a local path, data will be read from there. If a remote link, the target will be downloaded to cache_dir.
-  data_dir: ${paths.cache_dir}/data/ # Choose the location of the data. Should be used in data_io functions.
+  data_dir:  https://huggingface.co/datasets/open-retina/open-retina/resolve/main/baccus_lab/maheswaranathan_2023/neural_code_data.zip # Choose the location of the data. Should be used in data_io functions.
   log_dir: "/home/bethge/bkr618/hyperparams_search" # Used as parent for output_dir. Will store train logs.
   output_dir: ${hydra:runtime.output_dir} # Modify in the "hydra/default.yaml" config
-  movies_path: '/home/bethge/bkr618/openretina_cache/euler_lab/hoefling_2024/stimuli/rgc_natstim_72x64_joint_normalized_2024-10-11.pkl'
-  responses_path:  "/home/bethge/bkr618/openretina_cache/data/euler_lab/hoefling_2024/responses/rgc_natstim_2024-08-14.h5"
+#  movies_path: '/home/bethge/bkr618/openretina_cache/euler_lab/hoefling_2024/stimuli/rgc_natstim_72x64_joint_normalized_2024-10-11.pkl'
+#  responses_path:  "/home/bethge/bkr618/openretina_cache/data/euler_lab/hoefling_2024/responses/rgc_natstim_2024-08-14.h5"
 # Overwrite model defaults with specifics for the current data input format
 
 training_callbacks:

@@ -160,7 +160,7 @@ class SinusoidalPosEmb(nn.Module):
         
         # Use a larger max_length to accommodate test set
         # Adjust this value if needed (150 for your test set)
-        actual_max_length = max(max_length, 750)
+        actual_max_length = max(max_length, 10000)
         
         position = torch.arange(actual_max_length).unsqueeze(1)
         div_term = torch.exp(
@@ -193,14 +193,15 @@ class SinusoidalPosEmb(nn.Module):
         return self.dropout(outputs)
 
 class SparseAttentionViz(Callback):
-    def __init__(self, outdir, n_layers=1, device='cuda', head_limit=None):
+    def __init__(self, outdir, n_layers=1, device='cuda', head_limit=None, target_session=None):
         super().__init__()
         self.outdir = outdir
         os.makedirs(outdir, exist_ok=True)
         self.n_layers = n_layers  # Number of last layers to extract
         self.device = device
         self.head_limit = head_limit
-        print(f"[SparseAttentionViz] Initialized with outdir={outdir}, n_layers={n_layers}, device={device}, head_limit={head_limit}")
+        self.target_session = target_session  # Session name string to visualize (or None for first)
+        print(f"[SparseAttentionViz] Initialized with outdir={outdir}, n_layers={n_layers}, device={device}, head_limit={head_limit}, target_session={target_session}")
 
     def _find_core(self, pl_module):
         for name in ["core", "core_wrapper", "core_readout"]:
@@ -217,12 +218,43 @@ class SparseAttentionViz(Callback):
         # Run at the very end of training (works with early stopping)
         print(f"[SparseAttentionViz] Running visualization at end of training (epoch {trainer.current_epoch})")
         
-        # Safely get a batch from the first val dataloader
-        try:
-            session_name, batch = next(iter(trainer.val_dataloaders))
-            print(f"[SparseAttentionViz] Got batch from session: {session_name}")
-        except Exception as e:
-            print(f"[SparseAttentionViz] Failed to get validation batch: {e}")
+        # Iterate through validation dataloader to find target session
+        val_dataloaders = trainer.val_dataloaders
+        if not isinstance(val_dataloaders, list):
+            val_dataloaders = [val_dataloaders]
+        
+        session_name = None
+        batch = None
+        found = False
+        
+        # Try to find the target session
+        for val_loader in val_dataloaders:
+            try:
+                for item in val_loader:
+                    current_session_name = item[0]  # str with session name
+                    current_batch = item[1]  # batch object with .inputs and .targets
+                    
+                    # If target_session is None, take the first one
+                    # If target_session is specified, match it
+                    if self.target_session is None or current_session_name == self.target_session:
+                        session_name = current_session_name
+                        batch = current_batch
+                        found = True
+                        print(f"[SparseAttentionViz] Found target session: {session_name}")
+                        break
+                
+                if found:
+                    break
+                    
+            except Exception as e:
+                print(f"[SparseAttentionViz] Error iterating dataloader: {e}")
+                continue
+        
+        if not found or session_name is None or batch is None:
+            if self.target_session is not None:
+                print(f"[SparseAttentionViz] Could not find target session '{self.target_session}'")
+            else:
+                print(f"[SparseAttentionViz] Could not get any validation batch")
             return
 
         # Extract frames (videos) from batch.inputs
@@ -263,113 +295,167 @@ class SparseAttentionViz(Callback):
         plt.close(fig_orig)
         print(f"[SparseAttentionViz] Saved original frame to {orig_path}")
 
-        # Extract attention from last n_layers
-        all_layer_attns = []
-        all_layer_imps = []
-        
+        ###############################################################
+        # EXTRACT 30-FRAME SEQUENCE FROM LAST LAYER, ONE HEAD
+        ###############################################################
         with torch.no_grad():
-            # Tokenize once
-            tokens = core.tokenizer(frames)  # (B, T, P, C)
-            
-            # Get total number of layers (assuming get_spatial_attention_maps can handle this)
-            # First, get attention from layer -1 to determine total layers
-            attn_test = core.get_spatial_attention_maps(tokens, layer_idx=-1)
-            if attn_test is None:
+            # Pick random center frame
+            t0 = torch.randint(0, T, ()).item()
+
+            t_start = max(0, t0 - 14)
+            t_end   = min(T, t0 + 16)     # exclusive → gives 15 frames after t0
+
+            window_len = t_end - t_start
+            if window_len < 30:
+                if t_start == 0:
+                    t_end = min(T, 30)
+                else:
+                    t_start = max(0, T - 30)
+                window_len = t_end - t_start
+
+            if window_len != 30:
+                print(f"[SparseAttentionViz] Expected 30 frames, got {window_len}, aborting.")
+                return
+
+            print(f"[SparseAttentionViz] Using frames [{t_start}:{t_end}) around center frame t0={t0}")
+
+            # EFFICIENCY IMPROVEMENT: Tokenize only the frames we need
+            frames_window = frames[b:b+1, :, t_start:t_end]  # (1, C, 30, H0, W0)
+            tokens = core.tokenizer(frames_window)  # (1, 30, P, C)
+
+            # Extract attention once for all frames in the window
+            attn_full = core.get_spatial_attention_maps(tokens, layer_idx=-1)
+            if attn_full is None:
                 print("[SparseAttentionViz] Attention maps returned None")
                 return
-            
-            # Extract attention from last n_layers
-            for layer_offset in range(self.n_layers):
-                layer_idx = -(layer_offset + 1)  # -1, -2, -3, ...
-                print(f"[SparseAttentionViz] Extracting attention from layer {layer_idx}")
-                
-                attn = core.get_spatial_attention_maps(tokens, layer_idx=layer_idx)
-                if attn is None:
-                    print(f"[SparseAttentionViz] Attention maps returned None for layer {layer_idx}")
+
+            ###############################################
+            # Extract Gaussian readout grid (mu locations)
+            ###############################################
+            readout = pl_module.readout
+            session_readout = readout[session_name]
+
+            # sample=False → deterministic grid (means μ)
+            grid = session_readout.sample_grid(batch_size=1, sample=False)
+            # has shape: (1, outdims, 1, 2)
+
+            gx = grid[0, :, 0, 0].cpu()      # x coords in [-1,1]
+            gy = grid[0, :, 0, 1].cpu()      # y coords in [-1,1]
+
+            # convert normalized coord → patch index
+            px = ((gx + 1) * 0.5 * (core.new_w - 1)).round().long()
+            py = ((gy + 1) * 0.5 * (core.new_h - 1)).round().long()
+
+            # linear attention token index for each neuron
+            query_idx_per_neuron = py * core.new_w + px   # shape (outdims,)
+
+            # Force one head only
+            head_idx = 0
+
+            # Prepare arrays for original frames and overlaid frames
+            original_frames = []
+            overlaid_frames = []
+
+            # Loop through each frame in window
+            for frame_idx, t in enumerate(range(t_start, t_end)):
+                # Now attn_full has shape (1*30, n_heads, P, P) = (30, n_heads, P, P)
+                attn_bt = attn_full[frame_idx]  # (n_heads, P, P)
+                if attn_bt.ndim != 3:
+                    print("[SparseAttentionViz] Unexpected attn shape:", attn_bt.shape)
                     continue
 
-                print(f"[SparseAttentionViz] Layer {layer_idx} attention shape: {attn.shape}")
+                if head_idx >= attn_bt.shape[0]:
+                    print("[SparseAttentionViz] Requested head 0 but fewer heads exist.")
+                    return
 
-                # Pick the same random frame from attention maps
-                bt_index = torch.randint(0, attn.shape[0], ()).item()
-                attn = attn[bt_index]  # (n_heads, P, P)
-                n_heads = attn.shape[0]
-                if self.head_limit:
-                    n_heads = min(n_heads, self.head_limit)
-                    attn = attn[:n_heads]
-                
-                # convert attention to spatial importance
-                P = attn.shape[-1]
+                attn_head = attn_bt[head_idx]  # (P, P)
+
+                P = attn_head.shape[-1]
                 h_patch = core.new_h
                 w_patch = core.new_w
-                if P != h_patch * w_patch:
-                    print(f"[SparseAttentionViz] Warning: P={P} does not match h_patch*w_patch={h_patch*w_patch}, using sqrt(P) for visualization")
-                    h_patch = w_patch = int(P**0.5)
 
-                query_token = torch.randint(0, P, ()).item()
-                imp = attn[:, query_token, :].view(n_heads, h_patch, w_patch)
-                imp = imp - imp.amin(dim=(1,2), keepdim=True)
-                denom = imp.amax(dim=(1,2), keepdim=True)
-                denom[denom == 0] = 1
-                imp = imp / denom
+                # Query token for neuron 0
+                neuron = 100
+                query_token = query_idx_per_neuron[neuron].item()
 
-                # Upsample to original resolution
+                imp = attn_head[query_token].view(h_patch, w_patch)
+
+                # Normalize
+                imp = imp - imp.min()
+                mx = imp.max()
+                if mx > 0:
+                    imp = imp / mx
+
+                # Upsample to original frame size
                 imp_up = torch.nn.functional.interpolate(
-                    imp.unsqueeze(1), size=(H0, W0), mode="bilinear", align_corners=False
-                ).squeeze(1).cpu().numpy()
+                    imp[None, None, :, :],
+                    size=(H0, W0),
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze().cpu().numpy()
 
-                all_layer_attns.append(attn)
-                all_layer_imps.append(imp_up)
+                # Get original frame
+                frame_np = frames[b, :, t].cpu().numpy()
+                base = frame_np[0]  # Shape: (H0, W0)
 
-        if not all_layer_imps:
-            print("[SparseAttentionViz] No attention maps extracted")
-            return
+                # Store original frame
+                original_frames.append(base)
 
-        n_layers_extracted = len(all_layer_imps)
-        n_heads = all_layer_imps[0].shape[0]
-        print(f"[SparseAttentionViz] Extracted {n_layers_extracted} layers with {n_heads} heads each")
+                # Create overlaid frame by blending attention map with original
+                # Convert attention map to RGB using 'hot' colormap
+                import matplotlib.cm as cm
+                hot_cmap = cm.get_cmap('hot')
+                imp_colored = hot_cmap(imp_up)[:, :, :3]  # RGB, drop alpha
 
-        # Save individual images per layer and head
-        for layer_idx, imp_up in enumerate(all_layer_imps):
-            for head_idx in range(n_heads):
-                fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-                ax.imshow(frame_disp if C > 1 else frame_disp, cmap='gray' if C == 1 else None, vmin=0, vmax=1)
-                ax.imshow(imp_up[head_idx], cmap="jet", alpha=0.5, vmin=0, vmax=1)
-                ax.set_title(f"Layer {-(layer_idx+1)} - Head {head_idx}")
-                ax.axis("off")
+                # Blend: overlaid = (1-alpha)*base + alpha*attention
+                alpha = 0.45
+                if base.ndim == 2:  # Grayscale
+                    base_rgb = np.stack([base, base, base], axis=-1)
+                else:
+                    base_rgb = base
+                
+                overlaid = (1 - alpha) * base_rgb + alpha * imp_colored
+                overlaid = np.clip(overlaid, 0, 1)
+                
+                overlaid_frames.append(overlaid)
 
-                out_path = os.path.join(viz_folder, f"layer{layer_idx:02d}_head{head_idx:02d}.png")
-                plt.savefig(out_path, bbox_inches='tight', pad_inches=0)
-                plt.close(fig)
-        
-        print(f"[SparseAttentionViz] Saved {n_layers_extracted * n_heads} individual attention maps")
+            # Convert lists to numpy arrays
+            original_frames_arr = np.stack(original_frames, axis=0)  # Shape: (30, H0, W0)
+            overlaid_frames_arr = np.stack(overlaid_frames, axis=0)  # Shape: (30, H0, W0, 3)
 
-        # Create comprehensive subplot: original + all layers x all heads
-        fig, axes = plt.subplots(n_layers_extracted, n_heads + 1, figsize=(3 * (n_heads + 1), 3 * n_layers_extracted))
-        
-        # Handle single layer case
-        if n_layers_extracted == 1:
-            axes = axes.reshape(1, -1)
-        
-        for layer_idx in range(n_layers_extracted):
-            # First column: original frame
-            ax = axes[layer_idx, 0]
-            ax.imshow(frame_disp if C > 1 else frame_disp, cmap='gray' if C == 1 else None, vmin=0, vmax=1)
-            ax.set_title(f"Layer {-(layer_idx+1)}\nOriginal")
-            ax.axis("off")
+            # Save as numpy arrays
+            original_path = os.path.join(viz_folder, "original_frames.npy")
+            overlaid_path = os.path.join(viz_folder, "overlaid_frames.npy")
             
-            # Remaining columns: attention heads
-            imp_up = all_layer_imps[layer_idx]
-            for head_idx in range(n_heads):
-                ax = axes[layer_idx, head_idx + 1]
-                ax.imshow(frame_disp if C > 1 else frame_disp, cmap='gray' if C == 1 else None, vmin=0, vmax=1)
-                ax.imshow(imp_up[head_idx], cmap="jet", alpha=0.5, vmin=0, vmax=1)
-                ax.set_title(f"Head {head_idx}")
-                ax.axis("off")
-        
-        subplot_path = os.path.join(viz_folder, "all_layers_heads_grid.png")
-        plt.savefig(subplot_path, bbox_inches='tight', pad_inches=0.1)
-        plt.close(fig)
-        print(f"[SparseAttentionViz] Saved comprehensive grid to {subplot_path}")
-        
-        print(f"[SparseAttentionViz] Visualization complete in folder: {viz_folder}")
+            np.save(original_path, original_frames_arr)
+            np.save(overlaid_path, overlaid_frames_arr)
+
+            print(f"[SparseAttentionViz] Saved original frames to {original_path} with shape {original_frames_arr.shape}")
+            print(f"[SparseAttentionViz] Saved overlaid frames to {overlaid_path} with shape {overlaid_frames_arr.shape}")
+
+        return
+    
+import torch
+import torch.nn.functional as F
+
+def temporal_moving_average(x, kernel_size=3):
+    """
+    x: (B, T, P, Demb)
+    kernel_size: number of timesteps to average over (must be odd for symmetric)
+    """
+    assert kernel_size % 2 == 1, "Kernel size should be odd for symmetric smoothing"
+    pad = kernel_size // 2
+
+    # reshape to (B*P*Demb, 1, T) for conv1d
+    B, T, P, D = x.shape
+    x_reshape = x.permute(0, 2, 3, 1).reshape(B*P*D, 1, T)  # (B*P*D, 1, T)
+
+    # create averaging kernel
+    kernel = torch.ones(1, 1, kernel_size, device=x.device) / kernel_size
+
+    # apply conv1d with padding='same'
+    x_smooth = F.conv1d(x_reshape, kernel, padding=pad)
+
+    # reshape back
+    x_smooth = x_smooth.view(B, P, D, T).permute(0, 3, 1, 2)  # (B, T, P, Demb)
+    return x_smooth
