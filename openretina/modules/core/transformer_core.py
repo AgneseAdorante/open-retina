@@ -59,7 +59,7 @@ class ViViTCore(Core):
             pad_frame=bool(pad_frame),
             norm=norm,
             patch_mode=patch_mode,
-            pos_encoding=pos_encoding,
+            pos_encoding=pos_encoding
         )
 
         self.vivit = ViViT(
@@ -157,6 +157,59 @@ class ViViTCore(Core):
                     outputs = block(outputs)
 
         return None
+    
+    def get_temporal_attention_maps(self, inputs: torch.Tensor, layer_idx: int = -1):
+        """
+        Extract spatial attention maps from a specific layer.
+
+        Args:
+            inputs: (B, T, P, C) tensor (already tokenized)
+            layer_idx: which spatial transformer layer (-1 for last)
+
+        Returns:
+            attention_map: (B*T, num_heads, P, P)
+        """
+        self.eval()
+        with torch.no_grad():
+            outputs = inputs
+            b, t, p, _ = outputs.shape
+
+            outputs = rearrange(outputs, "b t p c -> (b p) t c")
+
+            target_idx = layer_idx if layer_idx >= 0 else len(self.vivit.temporal_transformer.blocks) - 1
+
+            for idx, block in enumerate(self.vivit.temporal_transformer.blocks):
+                if idx == target_idx:
+                    x = block.norm(outputs)
+                    q, k, v, ff = block.fused_linear(x).split(block.fused_dims, dim=-1)
+
+                    if block.normalize_qk:
+                        q, k = block.norm_q(q), block.norm_k(k)
+
+                    q = rearrange(q, "bt p (h d) -> bt h p d", h=block.num_heads)
+                    k = rearrange(k, "bt p (h d) -> bt h p d", h=block.num_heads)
+
+                    if block.use_rope:
+                        q, k = block.rotary_position_embedding(q=q, k=k)
+                    q_len = q.size(-2)
+                    k_len = k.size(-2)
+
+                    attn_bias = torch.zeros(q_len, k_len, device=q.device, dtype=q.dtype)
+
+                    if block.is_causal:
+                        mask = torch.ones(q_len, k_len, device=q.device, dtype=torch.bool).tril(0)
+                        attn_bias = attn_bias.masked_fill(~mask, float("-inf"))
+
+                    attn_weights = torch.matmul(q * block.scale, k.transpose(-2, -1))
+                    attn_weights = attn_weights + attn_bias
+                    attn_weights = torch.softmax(attn_weights, dim=-1)
+
+
+                    return attn_weights
+                else:
+                    outputs = block(outputs)
+
+        return None
 
     def regularizer(self):
         return self.vivit.regularizer()
@@ -179,3 +232,4 @@ class ViViTCore(Core):
         outputs = self.rearrange(outputs)
 
         return outputs
+    

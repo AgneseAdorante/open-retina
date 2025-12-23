@@ -11,6 +11,7 @@ from openretina.modules.readout.base import ClonedReadout, Readout
 from openretina.modules.readout.factorized import FactorizedReadout
 from openretina.modules.readout.factorized_gaussian import GaussianMaskReadout
 from openretina.modules.readout.gaussian import PointGaussianReadout
+from openretina.utils.transformer_utils import temporal_gaussian_smooth
 
 
 class MultiReadoutBase(nn.ModuleDict):
@@ -273,6 +274,8 @@ class MultiSampledGaussianReadout(MultiReadoutBase):
         bias: bool,
         init_mu_range: float,
         init_sigma_range: float,
+        kernel_size: int,
+        #smooth_param,
         batch_sample: bool = True,
         align_corners: bool = True,
         gauss_type: Literal["full", "iso"] = "full",
@@ -301,9 +304,16 @@ class MultiSampledGaussianReadout(MultiReadoutBase):
             gamma_readout=gamma,
             readout_reg_avg=reg_avg,
             mean_activity_dict=mean_activity_dict,
+            kernel_size = kernel_size,
+            #smooth_param =smooth_param
         )
 
         self.nonlinearity = nonlinearity_function
+        self.kernel_size = kernel_size
+        #self.smooth_param = smooth_param 
+        # Add this to your readout class
+        self.smooth_param = nn.Parameter(torch.log(torch.tensor(4.0)))
+
 
     def forward(self, *args, data_key: str | None = None, **kwargs) -> torch.Tensor:
         if data_key is None:
@@ -313,6 +323,7 @@ class MultiSampledGaussianReadout(MultiReadoutBase):
                 resp = self[readout_key](out_core, **kwargs)
                 resp = rearrange(resp, "(batch time) neurons -> batch time neurons", batch=args[0].size(0))
                 resp = self.nonlinearity(resp)
+                resp = temporal_gaussian_smooth(resp, kernel_size=self.kernel_size, log_sigma = self.smooth_param)
                 readout_responses.append(resp)
 
             response = torch.concatenate(readout_responses, dim=-1)
@@ -321,5 +332,7 @@ class MultiSampledGaussianReadout(MultiReadoutBase):
             response = self[data_key](out_core, **kwargs)
             response = rearrange(response, "(batch time) neurons -> batch time neurons", batch=args[0].size(0))
             response = self.nonlinearity(response)
+            response = temporal_gaussian_smooth(response, kernel_size=self.kernel_size, log_sigma=self.smooth_param)
 
         return response
+

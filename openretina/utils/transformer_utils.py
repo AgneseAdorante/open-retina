@@ -8,6 +8,8 @@ from einops import einsum, rearrange
 from lightning.pytorch.callbacks import Callback
 from torch import nn
 from torchvision.ops import stochastic_depth
+import numpy as np
+import matplotlib.cm as cm
 
 
 class DropPath(nn.Module):
@@ -182,203 +184,6 @@ class SinusoidalPosEmb(nn.Module):
         return self.dropout(outputs)
 
 
-class SparseAttentionViz(Callback):
-    def __init__(self, outdir, n_layers=1, device="cuda", head_limit=None):
-        super().__init__()
-        self.outdir = outdir
-        os.makedirs(outdir, exist_ok=True)
-        self.n_layers = n_layers  # Number of last layers to extract
-        self.device = device
-        self.head_limit = head_limit
-        print(
-            f"[SparseAttentionViz] Initialized with outdir={outdir}, n_layers={n_layers}, "
-            f"device={device}, head_limit={head_limit}"
-        )
-
-    def _find_core(self, pl_module):
-        for name in ["core", "core_wrapper", "core_readout"]:
-            if hasattr(pl_module, name):
-                obj = getattr(pl_module, name)
-                if hasattr(obj, "tokenizer") and hasattr(obj, "get_spatial_attention_maps"):
-                    print(f"[SparseAttentionViz] Found core: {name}")
-                    return obj
-        if hasattr(pl_module, "module"):
-            return self._find_core(pl_module.module)
-        raise RuntimeError("No core with tokenizer+get_spatial_attention_maps found")
-
-    def on_train_end(self, trainer, pl_module):
-        # Run at the very end of training (works with early stopping)
-        print(f"[SparseAttentionViz] Running visualization at end of training (epoch {trainer.current_epoch})")
-
-        # Safely get a batch from the first val dataloader
-        try:
-            session_name, batch = next(iter(trainer.val_dataloaders))
-            print(f"[SparseAttentionViz] Got batch from session: {session_name}")
-        except Exception as e:
-            print(f"[SparseAttentionViz] Failed to get validation batch: {e}")
-            return
-
-        # Extract frames (videos) from batch.inputs
-        frames = getattr(batch, "inputs", None)
-        if frames is None or not torch.is_tensor(frames) or frames.ndim != 5:
-            print(
-                f"[SparseAttentionViz] batch.inputs not found or not 5D, got {type(frames)}"
-                f" with shape {getattr(frames, 'shape', None)}"
-            )
-            return
-
-        frames = frames.to(self.device)
-        B, C, T, H0, W0 = frames.shape
-        print(f"[SparseAttentionViz] Frames shape: {frames.shape}")
-
-        # pick random b,t for display
-        b = torch.randint(0, B, ()).item()
-        t = torch.randint(0, T, ()).item()
-        print(f"[SparseAttentionViz] Selected random indices b={b}, t={t}")
-
-        # find core
-        core = self._find_core(pl_module)
-        core.eval()
-
-        # Create output folder for this visualization
-        viz_folder = os.path.join(self.outdir, f"epoch{trainer.current_epoch:03d}_{session_name}_b{b}_t{t}")
-        os.makedirs(viz_folder, exist_ok=True)
-        print(f"[SparseAttentionViz] Created folder: {viz_folder}")
-
-        # Get original frame for overlay
-        frame_np = frames[b, :, t].cpu().numpy()
-        frame_disp = frame_np[0]
-
-        # Save the original frame
-        fig_orig, ax_orig = plt.subplots(1, 1, figsize=(6, 6))
-        ax_orig.imshow(frame_disp if C > 1 else frame_disp, cmap="gray" if C == 1 else None, vmin=0, vmax=1)
-        ax_orig.set_title("Original Frame")
-        ax_orig.axis("off")
-        orig_path = os.path.join(viz_folder, "original_frame.png")
-        plt.savefig(orig_path, bbox_inches="tight", pad_inches=0)
-        plt.close(fig_orig)
-        print(f"[SparseAttentionViz] Saved original frame to {orig_path}")
-
-        # Extract attention from last n_layers
-        all_layer_attns = []
-        all_layer_imps = []
-
-        with torch.no_grad():
-            # Tokenize once
-            tokens = core.tokenizer(frames)  # (B, T, P, C)
-
-            # Get total number of layers (assuming get_spatial_attention_maps can handle this)
-            # First, get attention from layer -1 to determine total layers
-            attn_test = core.get_spatial_attention_maps(tokens, layer_idx=-1)
-            if attn_test is None:
-                print("[SparseAttentionViz] Attention maps returned None")
-                return
-
-            # Extract attention from last n_layers
-            for layer_offset in range(self.n_layers):
-                layer_idx = -(layer_offset + 1)  # -1, -2, -3, ...
-                print(f"[SparseAttentionViz] Extracting attention from layer {layer_idx}")
-
-                attn = core.get_spatial_attention_maps(tokens, layer_idx=layer_idx)
-                if attn is None:
-                    print(f"[SparseAttentionViz] Attention maps returned None for layer {layer_idx}")
-                    continue
-
-                print(f"[SparseAttentionViz] Layer {layer_idx} attention shape: {attn.shape}")
-
-                # Pick the same random frame from attention maps
-                bt_index = torch.randint(0, attn.shape[0], ()).item()
-                attn = attn[bt_index]  # (n_heads, P, P)
-                n_heads = attn.shape[0]
-                if self.head_limit:
-                    n_heads = min(n_heads, self.head_limit)
-                    attn = attn[:n_heads]
-
-                # convert attention to spatial importance
-                P = attn.shape[-1]
-                h_patch = core.new_h
-                w_patch = core.new_w
-                if P != h_patch * w_patch:
-                    print(
-                        f"[SparseAttentionViz] Warning: P={P} does not match h_patch*w_patch={h_patch * w_patch},"
-                        " using sqrt(P) for visualization"
-                    )
-                    h_patch = w_patch = int(P**0.5)
-
-                query_token = torch.randint(0, P, ()).item()
-                imp = attn[:, query_token, :].view(n_heads, h_patch, w_patch)
-                imp = imp - imp.amin(dim=(1, 2), keepdim=True)
-                denom = imp.amax(dim=(1, 2), keepdim=True)
-                denom[denom == 0] = 1
-                imp = imp / denom
-
-                # Upsample to original resolution
-                imp_up = (
-                    torch.nn.functional.interpolate(
-                        imp.unsqueeze(1), size=(H0, W0), mode="bilinear", align_corners=False
-                    )
-                    .squeeze(1)
-                    .cpu()
-                    .numpy()
-                )
-
-                all_layer_attns.append(attn)
-                all_layer_imps.append(imp_up)
-
-        if not all_layer_imps:
-            print("[SparseAttentionViz] No attention maps extracted")
-            return
-
-        n_layers_extracted = len(all_layer_imps)
-        n_heads = all_layer_imps[0].shape[0]
-        print(f"[SparseAttentionViz] Extracted {n_layers_extracted} layers with {n_heads} heads each")
-
-        # Save individual images per layer and head
-        for layer_idx, imp_up in enumerate(all_layer_imps):
-            for head_idx in range(n_heads):
-                fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-                ax.imshow(frame_disp if C > 1 else frame_disp, cmap="gray" if C == 1 else None, vmin=0, vmax=1)
-                ax.imshow(imp_up[head_idx], cmap="jet", alpha=0.5, vmin=0, vmax=1)
-                ax.set_title(f"Layer {-(layer_idx + 1)} - Head {head_idx}")
-                ax.axis("off")
-
-                out_path = os.path.join(viz_folder, f"layer{layer_idx:02d}_head{head_idx:02d}.png")
-                plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
-                plt.close(fig)
-
-        print(f"[SparseAttentionViz] Saved {n_layers_extracted * n_heads} individual attention maps")
-
-        # Create comprehensive subplot: original + all layers x all heads
-        fig, axes = plt.subplots(n_layers_extracted, n_heads + 1, figsize=(3 * (n_heads + 1), 3 * n_layers_extracted))
-
-        # Handle single layer case
-        if n_layers_extracted == 1:
-            axes = axes.reshape(1, -1)
-
-        for layer_idx in range(n_layers_extracted):
-            # First column: original frame
-            ax = axes[layer_idx, 0]
-            ax.imshow(frame_disp if C > 1 else frame_disp, cmap="gray" if C == 1 else None, vmin=0, vmax=1)
-            ax.set_title(f"Layer {-(layer_idx + 1)}\nOriginal")
-            ax.axis("off")
-
-            # Remaining columns: attention heads
-            imp_up = all_layer_imps[layer_idx]
-            for head_idx in range(n_heads):
-                ax = axes[layer_idx, head_idx + 1]
-                ax.imshow(frame_disp if C > 1 else frame_disp, cmap="gray" if C == 1 else None, vmin=0, vmax=1)
-                ax.imshow(imp_up[head_idx], cmap="jet", alpha=0.5, vmin=0, vmax=1)
-                ax.set_title(f"Head {head_idx}")
-                ax.axis("off")
-
-        subplot_path = os.path.join(viz_folder, "all_layers_heads_grid.png")
-        plt.savefig(subplot_path, bbox_inches="tight", pad_inches=0.1)
-        plt.close(fig)
-        print(f"[SparseAttentionViz] Saved comprehensive grid to {subplot_path}")
-
-        print(f"[SparseAttentionViz] Visualization complete in folder: {viz_folder}")
-
-
 def get_norm_layer(norm_type: str, normalized_shape: int | Tuple[int, ...]) -> nn.Module:
     norm_key = norm_type.lower()
     if norm_key in ("layernorm", "layer_norm", "ln"):
@@ -386,3 +191,425 @@ def get_norm_layer(norm_type: str, normalized_shape: int | Tuple[int, ...]) -> n
     if norm_key in ("rmsnorm", "rsmnorm", "rms_norm", "rsm_norm"):
         return nn.RMSNorm(normalized_shape)
     raise ValueError(f"Unsupported normalization type '{norm_type}'.")
+
+import os
+import torch
+import numpy as np
+from matplotlib import cm
+from scipy.ndimage import zoom
+def extract_attention_maps(
+    pl_module,
+    val_dataloader,
+    target_session,
+    outdir="./attention_viz",
+    device='cuda',
+    neuron_idx=0,
+    head_idx=0,
+    batch_idx=0,
+    highlight_patch=True,
+    highlight_color=(0.0, 0.0, 0.0),  # RGB, red by default
+    point_size=1
+):
+    """
+    Extract attention maps from a trained model, matching the temporal sampling
+    strategy used during prediction (patch centers), then interpolating to original
+    temporal dimension.
+    
+    Args:
+        pl_module: Lightning module with core and readout
+        val_dataloader: Validation dataloader
+        target_session: Session name to extract from
+        outdir: Output directory for saved arrays
+        device: Device to run inference on
+        neuron_idx: Index of neuron to visualize
+        head_idx: Attention head index
+        batch_idx: Batch index to use
+        highlight_patch: Whether to draw a point at the neuron's patch center
+        highlight_color: RGB tuple for the point color (values 0-1)
+        point_size: Radius of the point in pixels
+        
+    Returns:
+        dict with 'original_frames', 'overlaid_frames', 'attention_maps', 'metadata'
+    """
+    
+    pl_module.eval().to(device)
+    
+    # Find target session batch
+    batch = None
+    for session_name, data_point in val_dataloader:
+        if session_name == target_session:
+            batch = data_point
+            break
+    
+    if batch is None:
+        raise ValueError(f"Session {target_session} not found in dataloader")
+    
+    # Get input frames
+    frames = batch.inputs.to(device)  # (B, C, T, H, W)
+    B, C, T, H, W = frames.shape
+    b = min(batch_idx, B - 1)
+    
+    # Get tokenizer parameters
+    core = pl_module.core
+    kernel_size = core.tokenizer.kernel_size[0]
+    stride = core.tokenizer.stride[0]
+    
+    # Compute patch centers (same as in training_step)
+    num_patches = (T - kernel_size) // stride + 1
+    patch_center_indices = torch.arange(num_patches, device=device) * stride + kernel_size // 2
+    
+    print(f"Video shape: {frames.shape}")
+    print(f"Temporal params: kernel={kernel_size}, stride={stride}")
+    print(f"Number of patches: {num_patches}, centers at: {patch_center_indices.tolist()}")
+    
+    # Forward pass to get attention maps
+    with torch.no_grad():
+        frames_batch = frames[b:b+1]
+        tokens = core.tokenizer(frames_batch)
+        attn_maps = core.get_spatial_attention_maps(tokens, layer_idx=-1)  # (num_patches, num_heads, P, P)
+        
+        if attn_maps is None:
+            raise ValueError("Model returned None for attention maps")
+    
+    # Get spatial dimensions
+    H_tok, W_tok = core.tokenizer.new_shape
+    P = H_tok * W_tok
+    
+    # Get neuron's spatial location
+    session_readout = pl_module.readout[target_session]
+    grid = session_readout.grid  # (1, N_neurons, 1, 2)
+    gx, gy = grid[0, neuron_idx, 0, 0], grid[0, neuron_idx, 0, 1]  # [-1, 1] normalized
+    print(attention_entropy(attn_maps))
+    
+    # Convert to patch coordinates
+    x_patch = int(torch.clamp(((gx + 1) * 0.5 * W_tok), 0, W_tok - 1).item())
+    y_patch = int(torch.clamp(((gy + 1) * 0.5 * H_tok), 0, H_tok - 1).item())
+    neuron_patch_idx = y_patch * W_tok + x_patch
+    
+    print(f"Neuron {neuron_idx} at grid ({gx:.2f}, {gy:.2f}) -> patch ({y_patch}, {x_patch}) = {neuron_patch_idx}")
+    
+    # Calculate patch center in original resolution
+    patch_h = H / H_tok
+    patch_w = W / W_tok
+    center_y = int((y_patch + 0.5) * patch_h)
+    center_x = int((x_patch + 0.5) * patch_w)
+    
+    print(f"Patch center in original resolution: ({center_y}, {center_x})")
+    
+    # Extract attention at patch centers
+    attention_at_centers = []
+    for patch_idx in range(num_patches):
+        attn_head = attn_maps[patch_idx, head_idx]  # (P, P)
+        attn_from_neuron = attn_head[:,neuron_patch_idx]  # (P,)
+        
+        # Reshape to spatial grid and normalize
+        attn_spatial = attn_from_neuron.view(H_tok, W_tok)
+        attn_spatial = (attn_spatial - attn_spatial.min())
+        if attn_spatial.max() > 0:
+            attn_spatial = attn_spatial / attn_spatial.max()
+        
+        # Upsample to original resolution
+        attn_upsampled = torch.nn.functional.interpolate(
+            attn_spatial[None, None, :, :],
+            size=(H, W),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze().cpu().numpy()
+        
+        attention_at_centers.append(attn_upsampled)
+    
+    # Interpolate attention maps to original temporal dimension
+    attention_at_centers = np.array(attention_at_centers)  # (num_patches, H, W)
+    
+    # Use scipy zoom for temporal interpolation
+    temporal_zoom_factor = T / num_patches
+    attention_maps_full = zoom(attention_at_centers, (temporal_zoom_factor, 1, 1), order=1)
+    
+    # Ensure exact length match
+    if attention_maps_full.shape[0] != T:
+        attention_maps_full = attention_maps_full[:T]
+    
+    # Create overlaid visualizations
+    original_frames = []
+    overlaid_frames = []
+    
+    frames_cpu = frames[b].cpu().numpy()  # (C, T, H, W)
+    for t in range(T):
+        frame = frames_cpu[:, t, :, :]  # (C, H, W)
+        attn = attention_maps_full[t]  # (H, W)
+        
+        # Normalize frame
+        base = frame[0]
+        base_norm = (base - base.min()) / (base.max() - base.min() + 1e-8)
+        
+        # Apply colormap to attention
+        cmap = cm.get_cmap('viridis')
+        attn_colored = cmap(attn)[:, :, :3]
+        
+        # Overlay
+        base_rgb = np.stack([base_norm] * 3, axis=-1)
+        overlaid = np.clip(0.55 * base_rgb + 0.45 * attn_colored, 0, 1)
+        
+        # Draw point at neuron's patch center
+        if highlight_patch:
+            # Create a circular mask
+            y_coords, x_coords = np.ogrid[:H, :W]
+            mask = (y_coords - center_y)**2 + (x_coords - center_x)**2 <= point_size**2
+            overlaid[mask] = highlight_color
+        
+        original_frames.append(frame)
+        overlaid_frames.append(overlaid)
+    
+    # Save results
+    os.makedirs(outdir, exist_ok=True)
+    save_name = f"{target_session}_b{b}_neuron{neuron_idx}_head{head_idx}"
+    
+    np.save(os.path.join(outdir, f"{save_name}_original.npy"), np.stack(original_frames))
+    np.save(os.path.join(outdir, f"{save_name}_overlaid.npy"), np.stack(overlaid_frames))
+    np.save(os.path.join(outdir, f"{save_name}_attention.npy"), attention_maps_full)
+    
+    print(f"Saved to {outdir}/{save_name}_*.npy")
+    
+    metadata = {
+        'session_name': target_session,
+        'batch_idx': b,
+        'neuron_idx': neuron_idx,
+        'head_idx': head_idx,
+        'shape': (T, H, W),
+        'num_patches': num_patches,
+        'patch_centers': patch_center_indices.cpu().tolist(),
+        'temporal_stride': stride,
+        'temporal_kernel_size': kernel_size,
+        'neuron_patch_idx': neuron_patch_idx,
+        'patch_center_coords': (center_y, center_x)
+    }
+    
+    return {
+        'original_frames': np.stack(original_frames),
+        'overlaid_frames': np.stack(overlaid_frames),
+        'attention_maps': attention_maps_full,
+        'metadata': metadata
+    }
+import torch
+import torch.nn.functional as F
+import torch
+
+import torch
+
+def attention_entropy(attn):
+    """
+    attn: Tensor of shape (num_patches, num_heads, P, P)
+    returns a vector of length num_heads with average entropy per head
+    """
+    p = attn.clamp(min=1e-12)
+    entropy = -(p * p.log()).sum(dim=-1)               # sum over key dimension (P)
+    return entropy.mean(dim=(0, 2))                   # average over patches and queries
+
+
+def temporal_gaussian_smooth(x, kernel_size=15, log_sigma=None):
+    """
+    Gaussian smoothing with learnable or fixed sigma
+    x: (B, T, N)
+    log_sigma: learnable parameter (scalar tensor) or None for fixed sigma=4.0
+    """
+    pad = kernel_size // 2
+    B, T, N = x.shape
+    
+    # Store original mean per sequence
+    original_mean = x.mean(dim=1, keepdim=True)  # (B, 1, N)
+    
+    x_reshape = x.permute(0, 2, 1).reshape(B*N, 1, T)
+    x_padded = F.pad(x_reshape, (pad, pad), mode='replicate')
+    
+    # Use learnable sigma if provided, otherwise fixed
+    if log_sigma is not None:
+        sigma = torch.exp(log_sigma) 
+    else:
+        sigma = 4.0
+    
+    # Create Gaussian kernel
+    coords = torch.arange(kernel_size, device=x.device, dtype=torch.float32)
+    coords = coords - kernel_size // 2
+    kernel = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+    kernel = kernel.view(1, 1, -1)
+    
+    # Convolution
+    x_smooth = F.conv1d(x_padded, kernel, padding=0)
+    x_smooth = x_smooth.view(B, N, T).permute(0, 2, 1)
+    
+    # Restore original mean
+    smoothed_mean = x_smooth.mean(dim=1, keepdim=True)
+    x_smooth = x_smooth - smoothed_mean + original_mean
+    
+    return x_smooth
+
+
+import os
+import torch
+import numpy as np
+from matplotlib import cm
+
+
+
+
+def extract_temporal_attention_maps(
+    pl_module,
+    val_dataloader,
+    target_session,
+    outdir="./attention_viz",
+    device='cuda',
+    neuron_idx=0,
+    head_idx=0,
+    batch_idx=0
+):
+    """
+    Extract attention maps from a trained model, matching the temporal sampling
+    strategy used during prediction (patch centers), then interpolating to original
+    temporal dimension.
+    
+    Args:
+        pl_module: Lightning module with core and readout
+        val_dataloader: Validation dataloader
+        target_session: Session name to extract from
+        outdir: Output directory for saved arrays
+        device: Device to run inference on
+        neuron_idx: Index of neuron to visualize
+        head_idx: Attention head index
+        batch_idx: Batch index to use
+        
+    Returns:
+        dict with 'original_frames', 'overlaid_frames', 'attention_maps', 'metadata'
+    """
+    
+    pl_module.eval().to(device)
+    
+    # Find target session batch
+    batch = None
+    for session_name, data_point in val_dataloader:
+        if session_name == target_session:
+            batch = data_point
+            break
+    
+    if batch is None:
+        raise ValueError(f"Session {target_session} not found in dataloader")
+    
+    # Get input frames
+    frames = batch.inputs.to(device)  # (B, C, T, H, W)
+    B, C, T, H, W = frames.shape
+    b = min(batch_idx, B - 1)
+    
+    # Get tokenizer parameters
+    core = pl_module.core
+    kernel_size = core.tokenizer.kernel_size[0]
+    stride = core.tokenizer.stride[0]
+    
+    # Compute patch centers (same as in training_step)
+    num_patches = (T - kernel_size) // stride + 1
+    patch_center_indices = torch.arange(num_patches, device=device) * stride + kernel_size // 2
+    
+    print(f"Video shape: {frames.shape}")
+    print(f"Temporal params: kernel={kernel_size}, stride={stride}")
+    print(f"Number of patches: {num_patches}, centers at: {patch_center_indices.tolist()}")
+    
+    # Forward pass to get attention maps
+    with torch.no_grad():
+        frames_batch = frames[b:b+1]
+        tokens = core.tokenizer(frames_batch)
+        attn_maps = get_temporal_attention_maps_util(
+            tokens=tokens,
+            temporal_blocks=core.vivit.temporal_transformer.blocks,
+            layer_idx=-1
+        )
+
+        
+        if attn_maps is None:
+            raise ValueError("Model returned None for attention maps")
+    print(attention_entropy(attn_maps))
+
+    # Get spatial dimensions
+    H_tok, W_tok = core.tokenizer.new_shape
+    P = H_tok * W_tok
+    
+    # Get neuron's spatial location
+    session_readout = pl_module.readout[target_session]
+    grid = session_readout.grid  # (1, N_neurons, 1, 2)
+    gx, gy = grid[0, neuron_idx, 0, 0], grid[0, neuron_idx, 0, 1]  # [-1, 1] normalized
+    
+    # Convert to patch coordinates
+    x_patch = int(torch.clamp(((gx + 1) * 0.5 * W_tok), 0, W_tok - 1).item())
+    y_patch = int(torch.clamp(((gy + 1) * 0.5 * H_tok), 0, H_tok - 1).item())
+    neuron_patch_idx = y_patch * W_tok + x_patch
+    
+    print(f"Neuron {neuron_idx} at grid ({gx:.2f}, {gy:.2f}) -> patch ({y_patch}, {x_patch}) = {neuron_patch_idx}")      
+      
+    # Save results
+    os.makedirs(outdir, exist_ok=True)
+    save_name = f"{target_session}_b{b}_neuron{neuron_idx}_head{head_idx}"
+    mappa = attn_maps[:,head_idx,:,:].cpu()
+    
+    np.save(os.path.join(outdir, f"{save_name}_temporal.npy"), mappa)
+    
+    print(f"Saved to {outdir}/{save_name}_*.npy")
+    
+    return mappa
+
+def get_temporal_attention_maps_util(
+    tokens: torch.Tensor,
+    temporal_blocks,
+    layer_idx: int = -1
+):
+    """
+    Compute temporal attention maps for a given token tensor and a list of transformer blocks.
+    
+    Args:
+        tokens: (B, T, P, C) tensor (already tokenized)
+        temporal_blocks: list/ModuleList of temporal transformer blocks
+        layer_idx: which block index (-1 = final)
+        
+    Returns:
+        attn_weights: (B*T, num_heads, P, P)
+    """
+    with torch.no_grad():
+        x = tokens
+        b, t, p, c = x.shape
+        
+        # Rearrange to match original encoding order
+        x = rearrange(x, "b t p c -> (b p) t c")
+        
+        target_idx = layer_idx if layer_idx >= 0 else len(temporal_blocks) - 1
+        
+        for idx, block in enumerate(temporal_blocks):
+            if idx == target_idx:
+                # Same logic as your method
+                x_norm = block.norm(x)
+                q, k, v, ff = block.fused_linear(x_norm).split(block.fused_dims, dim=-1)
+
+                if block.normalize_qk:
+                    q = block.norm_q(q)
+                    k = block.norm_k(k)
+
+                q = rearrange(q, "b t (h d) -> b h t d", h=block.num_heads)
+                k = rearrange(k, "b t (h d) -> b h t d", h=block.num_heads)
+
+                if block.use_rope:
+                    q, k = block.rotary_position_embedding(q=q, k=k)
+
+                q_len = q.size(-2)
+                k_len = k.size(-2)
+
+                attn_bias = torch.zeros(q_len, k_len, device=q.device, dtype=q.dtype)
+
+                if block.is_causal:
+                    mask = torch.ones(q_len, k_len, device=q.device, dtype=torch.bool).tril(0)
+                    attn_bias = attn_bias.masked_fill(~mask, float("-inf"))
+
+                attn = torch.matmul(q * block.scale, k.transpose(-2, -1))
+                attn = torch.softmax(attn + attn_bias, dim=-1)
+
+                return attn
+
+            else:
+                x = block(x)
+
+    return None

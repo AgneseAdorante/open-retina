@@ -1,0 +1,44 @@
+defaults:
+  - data_io: hoefling_2024 # For new data, create data_io config and put its name here
+  - quality_checks: hoefling_2024
+  - dataloader: hoefling_2024 # For new data, create dataloader config and put its name here
+  - model: transformer_core_readout
+  - training_callbacks:
+    - early_stopping
+    - lr_monitor
+    - model_checkpoint
+  - logger:
+    - tensorboard
+    - csv
+  - trainer: default_deterministic
+  - hydra: default
+  - _self_ # values in this config will overwrite the defaults
+
+exp_name: high_reg
+seed: 42
+check_stimuli_responses_match: false
+
+training_callbacks:
+  early_stopping:
+    patience: 10
+
+dataloader:
+  batch_size: 64
+  train_chunk_size: 50
+
+
+paths:
+  load_model_path: null
+  cache_dir: ${oc.env:OPENRETINA_CACHE_DIRECTORY}
+  data_dir: ${paths.cache_dir}/data/
+  log_dir: "/mnt/lustre/work/bethge/bkr618/hyperparams_search"
+  output_dir: ${hydra:runtime.output_dir}
+  movies_path: "https://huggingface.co/datasets/open-retina/open-retina/resolve/main/euler_lab/hoefling_2024/stimuli/rgc_natstim_72x64_joint_normalized_2024-10-11.zip"
+  responses_path: "https://huggingface.co/datasets/open-retina/open-retina/resolve/main/euler_lab/hoefling_2024/responses/rgc_natstim_2024-08-14.zip"
+
+
+
+trainer:
+  max_epochs: 100
+  precision: 16-mixed
+  accumulate_grad_batches: 5

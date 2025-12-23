@@ -12,6 +12,7 @@ from jaxtyping import Float, Int
 from lightning import LightningModule
 from lightning.pytorch.utilities import grad_norm
 from omegaconf import DictConfig
+import torch.nn.functional as F
 
 from openretina.data_io.base_dataloader import DataPoint
 from openretina.modules.core.base_core import Core, SimpleCoreWrapper
@@ -23,7 +24,6 @@ from openretina.modules.readout.multi_readout import (
     MultiSampledGaussianReadout,
 )
 from openretina.utils.file_utils import get_cache_directory, get_local_file_path
-from openretina.utils.transformer_utils import SparseAttentionViz
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ _MODEL_NAME_TO_REMOTE_LOCATION = {
     "karamanlis_2024_base": f"{_HUGGINGFACE_CHECKPOINTS_BASE_PATH}/24-01-2025/karamanlis_2024_base.ckpt",
     "maheswaranathan_2023_base": f"{_HUGGINGFACE_CHECKPOINTS_BASE_PATH}/24-01-2025/maheswaranathan_2023_base.ckpt",
 }
-
 
 class BaseCoreReadout(LightningModule):
     """
@@ -88,6 +87,29 @@ class BaseCoreReadout(LightningModule):
         # Finally, save hyperparameters without logging them to the logger objects for now
         self.save_hyperparameters(ignore=["n_neurons_dict"], logger=False)
 
+    def _sample_targets_at_patch_centers(self, targets: torch.Tensor, input_length: int) -> torch.Tensor:
+        """
+        Sample targets at the temporal positions corresponding to transformer patch centers.
+        
+        Args:
+            targets (torch.Tensor): Target tensor of shape (batch, time, neurons).
+            input_length (int): Length of the input sequence (number of frames).
+            
+        Returns:
+            torch.Tensor: Sampled targets at patch centers of shape (batch, num_patches, neurons).
+        """
+        kernel_size = self.core.tokenizer.kernel_size[0]
+        stride = self.core.tokenizer.stride[0]
+        
+        # Compute number of patches and their center positions
+        num_patches = (input_length - kernel_size) // stride + 1
+        indices = torch.arange(num_patches, device=targets.device) * stride + kernel_size // 2
+        
+        # Sample targets at patch center indices
+        sampled_targets = targets[:, indices, :]
+        
+        return sampled_targets
+
     def on_fit_start(self):
         for lg in self.trainer.loggers:
             lg.log_hyperparams({k: v for k, v in self.hparams.items() if k != "data_info"})
@@ -99,7 +121,11 @@ class BaseCoreReadout(LightningModule):
         readout_norms = grad_norm(self.readout, norm_type=2)
         self.log_dict(readout_norms, on_step=False, on_epoch=True)
 
-    def forward(self, x: Float[torch.Tensor, "batch channels t h w"], data_key: str | None = None) -> torch.Tensor:
+    def forward(
+        self, 
+        x: Float[torch.Tensor, "batch channels t h w"], 
+        data_key: str | None = None
+    ) -> torch.Tensor:
         output_core = self.core(x)
         output_readout = self.readout(output_core, data_key=data_key)
         return output_readout
@@ -107,11 +133,16 @@ class BaseCoreReadout(LightningModule):
     def training_step(self, batch: tuple[str, DataPoint], batch_idx: int) -> torch.Tensor:
         session_id, data_point = batch
         model_output = self.forward(data_point.inputs, session_id)
-        loss = self.loss.forward(model_output, data_point.targets)
+        
+        
+        # Sample targets at patch centers to match model output
+        #sampled_targets =data_point.targets
+        sampled_targets = self._sample_targets_at_patch_centers(data_point.targets, data_point.inputs.size(2))
+        loss = self.loss.forward(model_output, sampled_targets)
         regularization_loss_core = self.core.regularizer()
         regularization_loss_readout = self.readout.regularizer(session_id)  # type: ignore
         total_loss = loss + regularization_loss_core + regularization_loss_readout
-        correlation = -self.validation_loss.forward(model_output, data_point.targets)
+        correlation = -self.validation_loss.forward(model_output, sampled_targets)
 
         self.log("regularization_loss_core", regularization_loss_core, on_step=False, on_epoch=True)
         self.log("regularization_loss_readout", regularization_loss_readout, on_step=False, on_epoch=True)
@@ -124,11 +155,15 @@ class BaseCoreReadout(LightningModule):
     def validation_step(self, batch: tuple[str, DataPoint], batch_idx: int) -> torch.Tensor:
         session_id, data_point = batch
         model_output = self.forward(data_point.inputs, session_id)
-        loss = self.loss.forward(model_output, data_point.targets) / sum(model_output.shape)
+        
+        # Sample targets at patch centers to match model output
+        #sampled_targets =data_point.targets
+        sampled_targets = self._sample_targets_at_patch_centers(data_point.targets, data_point.inputs.size(2))
+        loss = self.loss.forward(model_output, sampled_targets) / sum(model_output.shape)
         regularization_loss_core = self.core.regularizer()
         regularization_loss_readout = self.readout.regularizer(session_id)  # type: ignore
         total_loss = loss + regularization_loss_core + regularization_loss_readout
-        correlation = -self.validation_loss.forward(model_output, data_point.targets)
+        correlation = -self.validation_loss.forward(model_output, sampled_targets)
 
         self.log("val_loss", loss, logger=True, prog_bar=True)
         self.log("val_regularization_loss_core", regularization_loss_core, logger=True)
@@ -141,8 +176,13 @@ class BaseCoreReadout(LightningModule):
     def test_step(self, batch: tuple[str, DataPoint], batch_idx: int, dataloader_idx: int = 0) -> torch.Tensor:
         session_id, data_point = batch
         model_output = self.forward(data_point.inputs, session_id)
-        loss = self.loss.forward(model_output, data_point.targets) / sum(model_output.shape)
-        avg_correlation = -self.validation_loss.forward(model_output, data_point.targets)
+      
+        # Sample targets at patch centers to match model output
+        #sampled_targets =data_point.targets
+        sampled_targets = self._sample_targets_at_patch_centers(data_point.targets, data_point.inputs.size(2))
+        
+        loss = self.loss.forward(model_output, sampled_targets) / sum(model_output.shape)
+        avg_correlation = -self.validation_loss.forward(model_output, sampled_targets)
         per_neuron_correlation = self.validation_loss._per_neuron_correlations
 
         # Add metric and performances to data_info for downstream tasks
@@ -152,7 +192,7 @@ class BaseCoreReadout(LightningModule):
         if "pretrained_performance" not in self.data_info:
             self.data_info["pretrained_performance"] = {}
 
-        # Also add cut frames if not present
+        # Store the number of frames sampled (output length vs target length)
         if "model_cut_frames" not in self.data_info:
             self.data_info["model_cut_frames"] = data_point.targets.size(1) - model_output.size(1)
 
@@ -322,6 +362,7 @@ class UnifiedCoreReadout(BaseCoreReadout):
         core_module = hydra.utils.instantiate(
             core,
             n_neurons_dict=n_neurons_dict,
+            #data_info = data_info
         )
 
         # determine input_shape of readout if it is not already present
@@ -590,5 +631,3 @@ class ViViTCoreReadout(BaseCoreReadout):
             weight_decay=weight_decay,
             data_info=data_info,
         )
-        attn_cache_dir = os.path.join(get_cache_directory(), "attn_sparse")
-        self.attn_viz = SparseAttentionViz(outdir=attn_cache_dir)

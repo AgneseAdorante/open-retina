@@ -7,20 +7,22 @@ core:
   _target_: openretina.modules.core.transformer_core.ViViTCore
   _convert_: object
   in_shape: ${model.in_shape}
-  patch_size: 14
-  temporal_patch_size: 15
-  spatial_stride: 7
+  patch_size: 12
+  temporal_patch_size: 35
+  spatial_stride: 6
   temporal_stride: 1
-  Demb: 16
+  Demb: 64
   ptoken: 0.0
-  pad_frame: true
+  pad_frame: false
   norm: "rmsnorm"
+  norm_kwargs:
+    elementwise_affine: true
   patch_mode: true
   pos_encoding: 5 # i.e. ROPE
   num_heads: 4
   reg_tokens: 10
-  num_spatial_blocks: 6
-  num_temporal_blocks: 6
+  num_spatial_blocks: 15
+  num_temporal_blocks: 4
   mlp_ratio: 2.0
   ff_activation: "relu"
   mha_dropout: 0.05
@@ -28,8 +30,7 @@ core:
   drop_path: 0.2
   use_causal_attention: true
   use_sdpa_attention: true
-  use_torch_compile: false
-  reg_scale: 0.0
+  reg_scale: 0.04184815819561255
 
 readout:
   _target_: openretina.modules.readout.multi_readout.MultiSampledGaussianReadout
@@ -38,7 +39,7 @@ readout:
   bias: true
   gamma: 0.4
   init_mu_range: 0.1
-  init_sigma_range: 0.15
+  init_sigma_range: 1
   reg_avg: False
   batch_sample: True
   align_corners: True
@@ -47,7 +48,9 @@ readout:
   shared_features: null
   init_grid: null
   shared_grid: null
+  kernel_size: 15
+  #smooth_param: 1.0
 
 # training
 learning_rate: 5e-3
-weight_decay: 0.15
+weight_decay: 0.05
